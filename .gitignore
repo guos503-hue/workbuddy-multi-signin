@@ -1,0 +1,11 @@
+# 运行时生成（每个用户自己的配置/凭据/日志，不入库）
+state/
+accounts.json
+panel.json
+signin.log
+signin.log.1
+__pycache__/
+*.pyc
+*.pyo
+Thumbs.db
+Desktop.ini

@@ -50,6 +50,19 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
+# ⚠️ 强制 stdout/stderr 用 UTF-8，不管外部环境怎么设。
+# 本脚本被面板以子进程方式调用（--balance-json / --ledger-json / --list-json），
+# 面板按 utf-8 读回。若本进程按 cp936/gbk 输出（当 PYTHONIOENCODING=gbk 时），
+# 中文（账号名 label 等）会被编成 GBK 字节，面板解出来就是 ♦♦（U+FFFD）。
+# 这里主动重绑，使输出编码与本脚本自身无关，杜绝该乱码。
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SIGNIN = os.path.join(HERE, "signin.py")
 LOG = os.path.join(HERE, "signin.log")
@@ -427,6 +440,508 @@ def bootstrap_state(uid, archive_path):
     return fresh, note
 
 
+# -------------------------------------------------------------- balance ------
+
+# 客户端账号面板「积分余额」的同源接口。注意：路径**不带 /v2**——
+# 客户端 CloudAccountRepo.resourcePrefix 为空串（这三条新接口的网关路由声明的是
+# 无前缀路径），带 /v2 会 404（实测）。
+BALANCE_PATH = "/billing/meter/get-user-resource-summary"
+
+# 套餐基础积分包（与客户端 CommodityCode + PLAN_BASE_CODES 同源）。
+# 国内版 freeMon 是版本基础用量，计入基础；其余包（运营裂变 / 拉新权益 / 礼包）
+# 计入「赠送」。
+PLAN_BASE_CODES = {
+    "TCACA_code_002_AkiJS3ZHF5",   # proMon
+    "TCACA_code_005_maRGyrHhw1",   # proMonPlus
+    "TCACA_code_003_FAnt7lcmRT",   # proYear
+    "TCACA_code_023_4xbGhMrE6q",   # youth
+    "TCACA_code_026_BaESVICNoi",   # advanced
+    "TCACA_code_027_0FCGVA6vSa",   # flagship
+    "TCACA_code_008_cfWoLwvjU4",   # freeMon（国内版：版本基础用量）
+}
+
+
+def _to_count(v):
+    """安全转数字；坏值/NaN/±inf 一律按 0 处理（json.loads 默认接受 Infinity 字面量）。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if f != f or f in (float("inf"), float("-inf")):
+        return 0.0
+    return f
+
+
+def parse_balance(body):
+    """从 get-user-resource-summary 返回体算「可用 / 赠送」；结构不对返回 None。
+
+    可用 = 各包周期剩余之和；赠送 = 其中非套餐基础包（裂变/拉新/礼包）的部分。
+    单取一个 PackageCode 会漏（同一码会有多条账号记录），必须逐条累加。
+    """
+    if not isinstance(body, dict):
+        return None
+    data = body.get("data")
+    if not isinstance(data, dict):
+        return None
+    packages = data.get("Packages")
+    if not isinstance(packages, list):
+        return None
+    total = 0.0
+    gift = 0.0
+    for item in packages:
+        if not isinstance(item, dict):
+            continue
+        remain = _to_count(item.get("CycleRemainCapacity"))
+        if remain <= 0:
+            remain = _to_count(item.get("CapacityRemainPrecise"))
+        if remain <= 0:
+            remain = _to_count(item.get("CapacityRemain"))
+        if remain <= 0:
+            continue
+        total += remain
+        if item.get("PackageCode") not in PLAN_BASE_CODES:
+            gift += remain
+    return {
+        "balance": int(round(total)),
+        "gift": int(round(gift)),
+        "unit": "credits",
+        "is_paid": bool(data.get("IsPaidUser")),
+        "plan": str(data.get("SubscriptionPackageName") or ""),
+    }
+
+
+def balance_auth_file(acc):
+    """给一个账号准备只读凭据文件；返回 (path, cleanup)。
+
+    只读、不续期——余额查询不该转动 token 链（续期是签到路径的事）。
+    live 模式直接用客户端归档原文件；自持账号读 DPAPI state 写成临时文件，
+    文件名与签到用的 `.run-<uid>.json` **不同**，以免两者并发时互相覆盖。
+    """
+    if acc.get("mode") != "live":
+        try:
+            session = load_state(acc["uid"])
+            os.makedirs(STATE_DIR, exist_ok=True)
+            path = os.path.join(STATE_DIR, ".run-balance-%s.json" % acc["uid"])
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(session, fh, ensure_ascii=False)
+            return path, True
+        except Exception:
+            pass  # 自持 state 尚未建立/解密失败 → 退回归档原文件
+    return acc["path"], False
+
+
+def query_balance(acc):
+    """查询单个账号的可用积分余额。任何异常都收敛为 ok=False，绝不抛出。"""
+    out = {"uid": acc["uid"], "label": acc["label"], "mode": acc["mode"], "ok": False}
+    lib = signin_lib()
+    path, cleanup = balance_auth_file(acc)
+    try:
+        try:
+            session = lib.resolve_session(lib.load_session_retry(path))
+            headers = lib.build_headers(session)
+            endpoint = ((session.get("auth") or {}).get("endpoint")
+                        or lib.DEFAULT_ENDPOINT).rstrip("/")
+        except Exception as e:
+            out["error"] = "auth"
+            out["report"] = "凭据不可用：%s" % str(e)[:140]
+            return out
+        try:
+            # retry=False：余额是面板上的即时读数，不为一格数字反复重试拖住界面
+            code, body = lib.post(endpoint + BALANCE_PATH, headers, {}, retry=False)
+        except Exception as e:
+            out["error"] = "network"
+            out["report"] = "查询失败：%s" % str(e)[:140]
+            return out
+        if code in (401, 403):
+            out["error"] = "auth"
+            out["report"] = "登录态过期（HTTP %s），请在客户端重新登录" % code
+            return out
+        parsed = parse_balance(body)
+        if not parsed:
+            bcode = body.get("code") if isinstance(body, dict) else "?"
+            out["error"] = "data"
+            out["report"] = "接口返回异常（http=%s code=%s）" % (code, bcode)
+            return out
+        out.update(parsed)
+        out["ok"] = True
+        return out
+    except Exception as e:  # 兜底：任何意外都不能把面板启动带崩
+        out["error"] = "unknown"
+        out["report"] = "%s: %s" % (type(e).__name__, str(e)[:140])
+        return out
+    finally:
+        if cleanup:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------- ledger ------
+
+# 积分明细（批次事件流）。
+#
+# 平台只提供**批次级**数据，没有逐笔消耗流水（客户端 app.asar 全量确认：
+# 「积分流水」「积分记录」「creditRecord」等零命中，客户端自身也没有流水页）。
+# 每个批次 = 一次发放，故把批次派生为事件流：
+#   - 每批 → 一条收入事件（来源 / 数量 / 获得时间）
+#   - 「已用完」批次 → 追加一条消耗支出事件，时间取 ExpiredTime（实测即用完那一刻，精确到秒）
+#   - 「已过期未用完」批次 → 追加一条到期作废支出事件，时间取 DeductionEndTime
+#   - 进行中的消耗（用了但没用完）没有时间戳，以「已用 X/Y」备注在收入事件上，不伪造时间
+#
+# 与余额查询同一纪律：只读、不占 .lock、不写 signin.log、不转动 token 链。
+
+LEDGER_FREE_PATH = "/billing/meter/get-user-resource-free-packages"
+LEDGER_PAID_PATH = "/billing/meter/get-user-resource-paid-packages"
+LEDGER_PAGE_SIZE = 200      # 契约上限 [1,200]，超出后端直接 ParameterInvalid
+LEDGER_MAX_PAGES = 10       # 与客户端 fetchAllPages 同限；触顶会告警而非静默少算
+
+LEDGER_SLICE_TYPE = 4       # 每日刷新的分片包，与客户端一致：不计入明细与总额
+
+LEDGER_CONFIG = os.path.join(HERE, "ledger.json")
+EXPIRE_WARN_DEFAULT = 30
+EXPIRE_WARN_MIN = 1
+EXPIRE_WARN_MAX = 365
+
+# 商品码全集（客户端 CommodityCode 常量）。free/paid 两个接口各有自己的码白名单，
+# 必须按白名单分流：把付费码传给 free 接口会被静默过滤成空列表。
+LEDGER_FREE_CODES = [
+    "TCACA_code_001_PqouKr6QWV",   # free
+    "TCACA_code_008_cfWoLwvjU4",   # freeMon
+    "TCACA_code_035_ArVxJcGDsm",   # freeMonIntl
+    "TCACA_code_006_DbXS0lrypC",   # gift
+    "TCACA_code_039_KRcQj7wUat",   # proTrialMon
+    "TCACA_code_040_mi9rCYg46x",   # proTrialYear
+    "TCACA_code_007_nzdH5h4Nl0",   # activity（运营裂变包）
+    "TCACA_code_028_NtpWi0jzXs",   # bonus28
+    "TCACA_code_029_6wCGEWquYy",   # bonus29
+    "TCACA_code_030_BjSt89qTvr",   # bonus30（拉新权益包）
+    "TCACA_code_037_WxOD3MpI2o",   # bonusIntl
+]
+LEDGER_PAID_CODES = [
+    "TCACA_code_002_AkiJS3ZHF5",   # proMon
+    "TCACA_code_005_maRGyrHhw1",   # proMonPlus
+    "TCACA_code_003_FAnt7lcmRT",   # proYear
+    "TCACA_code_023_4xbGhMrE6q",   # youth
+    "TCACA_code_026_BaESVICNoi",   # advanced
+    "TCACA_code_027_0FCGVA6vSa",   # flagship
+    "TCACA_code_009_0XmEQc2xOf",   # extra（加量包）
+    "TCACA_code_038_OhvqZtiPKr",   # extra38
+    "TCACA_code_036_lupO5WgNdG",   # extraIntl
+]
+
+_BJ_TZ = datetime.timezone(datetime.timedelta(hours=8))
+
+
+def ledger_config():
+    """预警阈值（天）：配置在积分模块配置中心（ledger.json 的 expireWarningDays）。
+
+    缺失/损坏回落默认 30；越界夹到 [1,365]。预警只是提示，不该因为一个坏配置让明细打不开。
+    """
+    raw = read_json(LEDGER_CONFIG) or {}
+    try:
+        days = int(raw.get("expireWarningDays"))
+    except (TypeError, ValueError):
+        return EXPIRE_WARN_DEFAULT
+    return max(EXPIRE_WARN_MIN, min(EXPIRE_WARN_MAX, days))
+
+
+def _parse_billing_ms(value):
+    """计费时间 → 毫秒时间戳。字段既可能是毫秒数（或数字串），也可能是 'YYYY-MM-DD HH:MM:SS'（北京时间）。"""
+    if value in (None, "", 0) or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        ms = int(value)
+        return ms if ms > 0 else None
+    s = str(value).strip()
+    if not s:
+        return None
+    if s.isdigit():
+        ms = int(s)
+        return ms if ms > 0 else None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return int(datetime.datetime.strptime(s, fmt).replace(tzinfo=_BJ_TZ).timestamp() * 1000)
+        except ValueError:
+            continue
+    return None
+
+
+def _iso_local(ms):
+    """毫秒时间戳 → ISO 8601 带本机时区偏移（前端按本地时区只做展示）。"""
+    if not ms:
+        return None
+    return datetime.datetime.fromtimestamp(ms / 1000.0, tz=datetime.timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def _batch_capacity(row):
+    """(总量, 已用量)。累积型优先，回落周期型（与客户端 resolvePackageCapacity 同口径）。"""
+    total = _to_count(row.get("CapacitySizePrecise"))
+    if total > 0:
+        raw_used = row.get("CapacityUsedPrecise")
+        used = _to_count(raw_used) if raw_used not in (None, "") else max(0.0, total - _to_count(row.get("CapacityRemainPrecise")))
+        return total, used
+    total = _to_count(row.get("CycleCapacitySizePrecise")) or _to_count(row.get("CycleCapacitySize"))
+    if total <= 0:
+        return 0.0, 0.0
+    raw_used = row.get("CycleCapacityUsedPrecise")
+    if raw_used not in (None, ""):
+        used = _to_count(raw_used)
+    else:
+        remain = _to_count(row.get("CycleCapacityRemainPrecise")) or _to_count(row.get("CycleCapacityRemain"))
+        used = max(0.0, total - remain)
+    return total, used
+
+
+def _batch_source(row):
+    """来源标签：优先 grantReason（Buddy 加油站签到 / 成长计划奖励 / 官方活动发放），回落包名。"""
+    for a in (row.get("AccountAttributes") or []):
+        if isinstance(a, dict) and a.get("Key") == "grantReason":
+            v = str(a.get("Value") or "").strip()
+            if v:
+                return v
+    return str(row.get("PackageName") or "").strip() or "其他"
+
+
+def _fetch_ledger_rows(lib, endpoint, headers):
+    """拉全量批次（free + paid 两路，去重合并）。返回 (rows, truncated)。"""
+    hdrs = dict(headers or {})
+    hdrs.setdefault("Accept-Language", "zh-CN")
+    rows, seen, truncated = [], set(), False
+    reported = 0
+    for path, codes in ((LEDGER_FREE_PATH, LEDGER_FREE_CODES), (LEDGER_PAID_PATH, LEDGER_PAID_CODES)):
+        if not codes:
+            continue
+        got = 0
+        for page in range(1, LEDGER_MAX_PAGES + 1):
+            body = {"PackageCodes": codes, "PageNumber": page, "PageSize": LEDGER_PAGE_SIZE,
+                    "IsDisplayTotalInfo": True}
+            code, resp = lib.post(endpoint + path, hdrs, body, retry=False)
+            if code != 200 or not isinstance(resp, dict):
+                raise RuntimeError("明细接口返回异常（http=%s，%s）" % (code, path.rsplit("/", 1)[-1]))
+            data = resp.get("data")
+            if not isinstance(data, dict):
+                break
+            accs = data.get("Accounts")
+            if not isinstance(accs, list) or not accs:
+                break
+            reported = max(reported, int(_to_count(data.get("TotalCount"))))
+            for r in accs:
+                if not isinstance(r, dict):
+                    continue
+                rid = str(r.get("ResourceId") or "").strip()
+                key = rid or "%s|%s|%s" % (r.get("PackageCode"), r.get("CreateTime"), r.get("DealName"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(r)
+                got += 1
+            if len(accs) < LEDGER_PAGE_SIZE:
+                break
+        # 单路已取尽但服务端声称更多 → 触顶截断，必须告警（客户端同款风险）
+        if reported > len(rows):
+            truncated = True
+    return rows, truncated
+
+
+def build_ledger(rows, warn_days, now_ms=None, plan=None, is_paid=False,
+                 uid=None, label=None):
+    """批次 → 事件流 + 汇总 + 最近到期 + 预警（全部在此算好，面板只负责展示）。
+
+    uid/label：本批数据的归属账号。会写进每条事件（含 upcoming），供面板在
+    「全部账号」合并视图里标注「来源：账号名」。面板不自行推断归属，避免串号。
+    """
+    now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    today = datetime.datetime.fromtimestamp(now_ms / 1000.0, tz=_BJ_TZ).date()
+    events, upcoming, sources = [], [], {}
+    available = 0.0
+    expired_deducted = 0.0
+    expired_batches = 0
+    batch_count = 0
+
+    def _day_diff(ms):
+        """按自然日计的剩余天数（与用户本地日历一致）。"""
+        return (datetime.datetime.fromtimestamp(ms / 1000.0, tz=_BJ_TZ).date() - today).days
+
+    for r in rows:
+        if _to_count(r.get("CapacityType")) == LEDGER_SLICE_TYPE:
+            continue
+        total, used = _batch_capacity(r)
+        if total <= 0:
+            continue
+        batch_count += 1
+        remain = max(0.0, total - used)
+        status = r.get("Status")
+        created = _parse_billing_ms(r.get("CreateTime"))
+        end_ms = _parse_billing_ms(r.get("DeductionEndTime")) or _parse_billing_ms(r.get("CycleEndTime"))
+        source = _batch_source(r)
+        name = str(r.get("PackageName") or "").strip()
+        rid = str(r.get("ResourceId") or "").strip() or ("b%d" % batch_count)
+
+        src = sources.setdefault(source, {"name": source, "count": 0, "amount": 0.0})
+        src["count"] += 1
+        src["amount"] = round(src["amount"] + total, 2)
+
+        events.append({
+            "id": rid, "direction": "income", "kind": "grant",
+            "source": source, "name": name,
+            "uid": uid, "label": label,
+            "amount": round(total, 2), "time": _iso_local(created), "timeMs": created,
+            "used": round(used, 2), "remain": round(remain, 2), "total": round(total, 2),
+            "status": status, "expireAt": _iso_local(end_ms),
+        })
+
+        # 支出：先按「已用完」（消耗），再按「已过期」（到期作废），两者互不重复计量
+        if status == 3 and used > 0:
+            t = _parse_billing_ms(r.get("ExpiredTime")) or end_ms
+            events.append({
+                "id": rid + ":used", "direction": "expense", "kind": "consume",
+                "source": source, "name": name,
+                "uid": uid, "label": label,
+                "amount": round(used, 2), "time": _iso_local(t), "timeMs": t,
+            })
+            # 已用完的批次若也已过到期日，剩余为 0，不产生到期扣减
+            if end_ms and end_ms <= now_ms:
+                expired_batches += 1
+        elif status == 2:
+            if remain > 0:
+                events.append({
+                    "id": rid + ":expired", "direction": "expense", "kind": "expire",
+                    "source": source, "name": name,
+                    "uid": uid, "label": label,
+                    "amount": round(remain, 2), "time": _iso_local(end_ms), "timeMs": end_ms,
+                })
+            if end_ms and end_ms <= now_ms:
+                expired_deducted += remain
+                expired_batches += 1
+
+        # 汇总口径：已到期批次按批次累计扣减（不按余额或到期时间聚合）
+        if end_ms and end_ms <= now_ms:
+            continue
+        if status in (0, 3) and remain > 0:
+            available += remain
+            days_left = _day_diff(end_ms) if end_ms else None
+            upcoming.append({
+                "id": rid, "source": source, "name": name,
+                "uid": uid, "label": label,
+                "amount": round(remain, 2), "total": round(total, 2), "used": round(used, 2),
+                "expireAt": _iso_local(end_ms), "expireDate": (
+                    datetime.datetime.fromtimestamp(end_ms / 1000.0, tz=_BJ_TZ).strftime("%Y-%m-%d") if end_ms else None),
+                "created": _iso_local(created), "daysLeft": days_left,
+                "warn": bool(days_left is not None and days_left <= warn_days),
+            })
+
+    upcoming.sort(key=lambda x: (x["expireAt"] or "9999", x["id"]))
+    for b in upcoming:
+        d = b.get("daysLeft")
+        b["warnLevel"] = ("danger" if d is not None and d <= 1 else
+                          "warning" if d is not None and d <= 3 else
+                          "notice" if b.get("warn") else "none")
+
+    # 事件按时间倒序；无时间戳的排最后（稳定按 id）
+    events.sort(key=lambda e: (-(e.get("timeMs") or 0), e.get("id") or ""))
+
+    within = [b for b in upcoming if b.get("warn")]
+    alert = None
+    if within:
+        # 口径（唯一规则）：条幅只报「最早到期日」当天的剩余积分合计。
+        # upcoming 已按 expireAt 升序 → within[0] 即最早；同一天的多批才合并。
+        # 严禁把更晚到期的批次聚合进来（需求原文明确禁止）。
+        earliest = within[0]["expireDate"]
+        same_day = [b for b in within if b.get("expireDate") == earliest]
+        amt = int(round(sum(b["amount"] for b in same_day)))
+        dt = datetime.datetime.strptime(earliest, "%Y-%m-%d")
+        alert = {
+            "show": True,
+            "total": amt,                       # 仅最早到期日当天的合计
+            "raw": round(sum(b["amount"] for b in same_day), 2),
+            "date": earliest,                   # 唯一日期规则：取最早
+            "batchCount": len(same_day),        # 当天批数
+            "withinTotal": int(round(sum(b["amount"] for b in within))),  # 预警窗口内全部合计（明细页用）
+            "withinCount": len(within),
+            "text": "%d 积分将于 %d 月 %d 日到期" % (amt, dt.month, dt.day),
+        }
+
+    return {
+        "generatedAt": _iso_local(now_ms),
+        "warnDays": warn_days,
+        "summary": {
+            "available": int(round(available)),
+            "availableRaw": round(available, 2),
+            "expiredDeducted": int(round(expired_deducted)),
+            "expiredDeductedRaw": round(expired_deducted, 2),
+            "expiredBatches": expired_batches,
+            "batches": batch_count,
+            "isPaid": bool(is_paid),
+            "plan": str(plan or ""),
+        },
+        "upcoming": {
+            "count": len(upcoming),
+            "withinWarn": len(within),
+            "batches": upcoming[:50],
+            "nearest": upcoming[0] if upcoming else None,
+        },
+        "alert": alert,
+        "sources": sorted(sources.values(), key=lambda s: (-s["count"], s["name"])),
+        "events": events,
+    }
+
+
+def query_ledger(acc):
+    """查询单个账号的积分明细。任何异常都收敛为 ok=False，绝不抛出。"""
+    out = {"uid": acc["uid"], "label": acc["label"], "mode": acc["mode"], "ok": False}
+    lib = signin_lib()
+    path, cleanup = balance_auth_file(acc)
+    try:
+        try:
+            session = lib.resolve_session(lib.load_session_retry(path))
+            headers = lib.build_headers(session)
+            endpoint = ((session.get("auth") or {}).get("endpoint")
+                        or lib.DEFAULT_ENDPOINT).rstrip("/")
+        except Exception as e:
+            out["error"] = "auth"
+            out["report"] = "凭据不可用：%s" % str(e)[:140]
+            return out
+        try:
+            rows, truncated = _fetch_ledger_rows(lib, endpoint, headers)
+        except Exception as e:
+            msg = str(e)
+            out["error"] = "auth" if ("401" in msg or "403" in msg) else "network"
+            out["report"] = "明细查询失败：%s" % msg[:140]
+            return out
+        if not rows:
+            # 接口通、确实没有批次 → 合法空态（不是错误）
+            out.update(build_ledger([], ledger_config(),
+                                    uid=acc["uid"], label=acc["label"]))
+            out["truncated"] = truncated
+            out["ok"] = True
+            return out
+        plan = None
+        is_paid = False
+        try:
+            code, body = lib.post(endpoint + BALANCE_PATH, headers, {}, retry=False)
+            parsed = parse_balance(body)
+            if parsed:
+                plan, is_paid = parsed.get("plan"), bool(parsed.get("is_paid"))
+        except Exception:
+            pass  # 汇总接口只影响「套餐」标注，失败不影响明细
+        out.update(build_ledger(rows, ledger_config(), plan=plan, is_paid=is_paid,
+                                uid=acc["uid"], label=acc["label"]))
+        out["truncated"] = truncated
+        out["ok"] = True
+        return out
+    except Exception as e:  # 兜底：任何意外都不能把面板带崩
+        out["error"] = "unknown"
+        out["report"] = "%s: %s" % (type(e).__name__, str(e)[:140])
+        return out
+    finally:
+        if cleanup:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
 # ------------------------------------------------------------------ run ------
 
 def make_session_file(uid, session):
@@ -619,11 +1134,47 @@ def main():
                     help="每个账号一行 JSON 输出（供面板实时消费）")
     ap.add_argument("--list-json", action="store_true", dest="list_json",
                     help="以 JSON 输出账号与凭据状态（供面板绘制表格）")
+    ap.add_argument("--balance-json", action="store_true", dest="balance_json",
+                    help="查询每个账号的可用积分余额，每账号一行 JSON（供面板消费）")
+    ap.add_argument("--ledger-json", action="store_true", dest="ledger_json",
+                    help="查询每个账号的积分明细（批次事件流+汇总+预警），每账号一行 JSON（供面板消费）")
     args = ap.parse_args()
 
     if not os.path.isfile(SIGNIN):
         print("缺少 signin.py：%s" % SIGNIN)
         return 2
+
+    if args.balance_json:
+        # 余额查询：与签到完全隔离（不加 .lock、不续期、不写 signin.log）。
+        # 每账号一行，立即刷出；失败也照样给行（带 error 字段），面板逐行更新。
+        accounts = discover()
+        if not accounts:
+            print(json.dumps({"event": "balance", "ok": False, "error": "no_accounts",
+                              "report": "未发现任何国内站凭据"}, ensure_ascii=False))
+            return 2
+        ok_all = True
+        for acc in accounts:
+            out = query_balance(acc)
+            out["event"] = "balance"
+            print(json.dumps(out, ensure_ascii=False), flush=True)
+            ok_all = ok_all and bool(out.get("ok"))
+        return 0 if ok_all else 1
+
+    if args.ledger_json:
+        # 积分明细：与签到完全隔离（不加 .lock、不续期、不写 signin.log）。
+        # 每账号一行 JSON（含事件流），失败也照给行（带 error 字段）。
+        accounts = discover()
+        if not accounts:
+            print(json.dumps({"event": "ledger", "ok": False, "error": "no_accounts",
+                              "report": "未发现任何国内站凭据"}, ensure_ascii=False))
+            return 2
+        ok_all = True
+        for acc in accounts:
+            out = query_ledger(acc)
+            out["event"] = "ledger"
+            print(json.dumps(out, ensure_ascii=False), flush=True)
+            ok_all = ok_all and bool(out.get("ok"))
+        return 0 if ok_all else 1
 
     if args.list_json:
         payload = []
